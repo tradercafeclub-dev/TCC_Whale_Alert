@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>TCC Whale Tracker v37</title>
+<title>TCC Whale Tracker v39</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐋</text></svg>"/>
 <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐋</text></svg>"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -13035,7 +13035,7 @@ let pendingLiqLabelsX = 0;
 // RAF state
 let needsRedraw    = false;
 let rafId          = null;
-let activeTrades   = [];   // double buffer — stable snapshot for buildBands
+// v39: เอา activeTrades ออก — เดิมถูก assign ใน buildBands (ถูกลบใน v38) ทำให้ LAYER 3 วนอาร์เรย์ว่างเสมอ; ตอนนี้ LAYER 3 อ่าน trades ตรงๆ
 // BUG-A FIX: epoch counter — buildBands ถูก rebuild เฉพาะตอน data จริงเปลี่ยน
 let _bandsEpoch    = 0;    // bump นี้เมื่อ candles/trades/liqZones/pAgg เปลี่ยน
 let _bandsBuiltAt  = -1;   // epoch ที่ bands ถูก rebuild ล่าสุด
@@ -13118,6 +13118,25 @@ async function fetchCandles() {
 }
 
 /* ═══════════════════════════════════════════════════════
+   v39: BACKOFF ฝั่ง client — /price และ /agg
+   - ใช้ setInterval เดิม (priceTimer/aggTimer ไม่เปลี่ยน) แต่ข้าม tick ระหว่างรอ backoff
+   - ล้มครั้งแรก: ลองตามรอบปกติ · ครั้งที่ 2+ : 2×, 4×, … ของรอบ polling สูงสุด 2 นาที
+   - สำเร็จ 1 ครั้ง → รีเซ็ตทันที · init() (เปลี่ยนเหรียญ/โหลดใหม่) รีเซ็ตเสมอ
+   - fetchAgg ยังคง fallback HL ตรงทุก tick ตามเดิม (HL ไม่ใช่ Worker) — backoff ลดเฉพาะการยิง Worker
+═══════════════════════════════════════════════════════ */
+const POLL_BO = { price: { fails: 0, nextAt: 0 }, agg: { fails: 0, nextAt: 0 } };
+const POLL_BO_MAX_MS = 120000;
+function _boWait(k) { return Date.now() < POLL_BO[k].nextAt; }
+function _boOk(k)   { POLL_BO[k].fails = 0; POLL_BO[k].nextAt = 0; }
+function _boFail(k, baseSec) {
+  const b = POLL_BO[k]; b.fails++;
+  // -1.5s: ชดเชย jitter ของ setInterval ให้ tick ที่ครบรอบพอดีผ่านได้
+  b.nextAt = b.fails < 2 ? 0
+    : Date.now() + Math.min(baseSec * 1000 * Math.pow(2, b.fails - 1), POLL_BO_MAX_MS) - 1500;
+}
+function _boReset() { for (const k in POLL_BO) _boOk(k); }
+
+/* ═══════════════════════════════════════════════════════
    FETCH PRICE — Priority 1: Worker /price → P_agg + liqZones (Phase 3)
    Fallback chain:
      P1: Worker /price  → P_agg (6 exchanges Volume-Weighted)
@@ -13126,6 +13145,7 @@ async function fetchCandles() {
 ═══════════════════════════════════════════════════════ */
 async function fetchPrice() {
   if (document.hidden) return;   // v45: แท็บถูกซ่อน → ไม่ poll (ลดโหลด GAS/HL)
+  if (_boWait('price')) return;   // v39: backoff หลัง /price ล้มติดกัน
   try {
     const _priceCtrl = new AbortController();
     const _priceTimeout = setTimeout(() => _priceCtrl.abort(), 12000);
@@ -13133,6 +13153,7 @@ async function fetchPrice() {
     clearTimeout(_priceTimeout);
     if (!r.ok) throw new Error('price fail ' + r.status);
     const d = await r.json();
+    _boOk('price');
 
     // ── อัปเดต P_agg state ──
     if (d.pAgg && d.pAgg > 0) {
@@ -13178,6 +13199,7 @@ async function fetchPrice() {
     _bandsEpoch++;  // BUG-A: data changed
     needsRedraw = true;
   } catch (e) {
+    _boFail('price', CFG.priceInterval);   // v39
     console.warn('[fetchPrice] fail:', e.message);
     // ไม่ set workerDown ที่นี่ — ให้ fetchAgg() จัดการ fallback chain ต่อ
   }
@@ -13190,6 +13212,7 @@ async function fetchPrice() {
 async function fetchAgg() {
   if (document.hidden) return;   // v45: แท็บถูกซ่อน → ไม่ poll (ลดโหลด GAS/HL)
   try {
+    if (_boWait('agg')) { const _sk = new Error('agg backoff'); _sk._boSkip = true; throw _sk; }   // v39: ข้ามการยิง Worker แต่ยังตกไป fallback HL ด้านล่างตามเดิม
     const _aggCtrl = new AbortController();
     const _aggTimeout = setTimeout(() => _aggCtrl.abort(), 15000);
     const r = await fetch(`${CFG.workerUrl}/agg?coin=${S.coin}`, { signal: _aggCtrl.signal });
@@ -13209,6 +13232,7 @@ async function fetchAgg() {
     // P_agg จาก /agg (ถ้า Worker v10 ส่ง pAgg ใน blended response แล้ว)
     if (d.blended.pAgg && !S.pAgg) S.pAgg = d.blended.pAgg;
     S.workerDown = false;
+    _boOk('agg');   // v39
 
     // Source status จาก REST /agg
     const workerSources = d.sources || {};
@@ -13251,6 +13275,7 @@ async function fetchAgg() {
     _bandsEpoch++;  // BUG-A: data changed
     needsRedraw = true;
   } catch (e) {
+    if (!(e && e._boSkip)) _boFail('agg', CFG.aggInterval);   // v39: นับเฉพาะล้มจริง ไม่นับ tick ที่ถูกข้าม
     // Priority 3 Fallback: ดึง Hyperliquid meta ตรง — เกิดเมื่อ Worker ล่ม/เข้าไม่ถึง
     S.workerDown = true;
     try {
@@ -14134,7 +14159,7 @@ function draw() {
      ข้ามแท่งสุดท้าย (forming candle) เพื่อป้องกัน dots กองซ้อนที่ราคาปัจจุบัน
      จุดเหล่านี้จะแสดงเมื่อแท่งปิดแล้วในรอบถัดไป */
   const lastCandAbsIdx = candles.length - 1;
-  for (const t of activeTrades) {
+  for (const t of trades) {
     if (t.usd < CFG.minUsd) continue;
     const absIdx = findCandleIndex(t.ts);
     if (absIdx < 0 || absIdx >= lastCandAbsIdx) continue; // ข้ามแท่งปัจจุบัน
@@ -14744,7 +14769,7 @@ function updateLiqFeedUI(live, blocked) {
 document.getElementById('coinSel').onchange = e => {
   S.coin = e.target.value;
   S.buyVol = 0; S.sellVol = 0;
-  trades = []; activeTrades = []; realLiqs = [];
+  trades = []; realLiqs = [];
   document.getElementById('feed').innerHTML = '';
   init();
 };
@@ -14951,6 +14976,7 @@ let priceTimer = null;
 let hmTimer    = null; // NEW v18: real heatmap refresh timer
 
 async function init() {
+  _boReset();   // v39: เปลี่ยนเหรียญ/โหลดใหม่ → ยิง /price /agg ทันที ไม่ติด backoff เดิม
   if (aggTimer)   clearInterval(aggTimer);
   if (priceTimer) clearInterval(priceTimer);
   if (hmTimer)    { clearTimeout(hmTimer); hmTimer = null; }
